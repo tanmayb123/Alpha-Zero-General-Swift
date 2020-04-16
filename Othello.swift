@@ -10,7 +10,7 @@ import Foundation
 import TensorFlow
 import PythonKit
 
-let OTHELLO_PATH = "/home/nimbix/othello"
+let OTHELLO_PATH = "/home/tajymany/othello"
 
 let sys = Python.import("sys")
 let np = Python.import("numpy")
@@ -270,6 +270,7 @@ struct OthelloModel: Layer {
 
         init(filterShape: (Int, Int, Int, Int), padding: Padding) {
             conv = Conv2D(filterShape: filterShape, padding: padding, useBias: false)
+        }
 
         func callAsFunction(_ input: Tensor<Float>) -> Tensor<Float> {
             return relu(conv(input))
@@ -344,7 +345,7 @@ struct OthelloNNet: NNet {
     var channels = 512
     var dropout = 0.3
     var epochs = 10
-    var batchSize = 64
+    var batchSize = 16384
     
     init(game: OthelloGame) {
         self.model = OthelloModel(game: game, channels: 512, dropout: 0.3)
@@ -360,7 +361,7 @@ struct OthelloNNet: NNet {
         let boards = toTensor(boards).makeNumpyArray()
         let pis = toTensor(pis).makeNumpyArray()
         let vs = toTensor(vs).makeNumpyArray()
-        pyInterface.pyModel.fit(boards, [pis, vs], verbose: 1, epochs: epochs, batch_size: batchSize * 4)
+        pyInterface.pyTrainer.train_model(pyInterface.pyModel, [boards, pis, vs], epochs: epochs, batch_size: batchSize)
         importPyWeights()
     }
     

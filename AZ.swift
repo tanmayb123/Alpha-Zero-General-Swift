@@ -174,63 +174,6 @@ public struct MCTS<Task: Game, Network: NNet> {
     }
 }
 
-class Arena<Task: Game> {
-    typealias Player = ([[Float]]) -> (Int)
-    
-    var player1: Player
-    var player2: Player
-    let game: Task
-    
-    init(player1: @escaping Player, player2: @escaping Player, game: Task) {
-        self.player1 = player1
-        self.player2 = player2
-        self.game = game
-    }
-    
-    func playGame() -> Float {
-        let players = [1: player1, -1: player2]
-        var currentPlayer = 1
-        var board = game.initBoard
-        while game.getGameEnded(board: board, player: currentPlayer) == 0 {
-            let action = players[currentPlayer]!(game.getCanonicalForm(board: board, player: currentPlayer))
-            let valids = game.getValidMoves(board: board, player: currentPlayer)
-            if valids[action] == 0 {
-                fatalError()
-            }
-            (board, currentPlayer) = game.getNextState(board: board, player: currentPlayer, action: action)
-        }
-        return Float(currentPlayer) * game.getGameEnded(board: board, player: currentPlayer)
-    }
-    
-    func playGames(num: Int) -> (Int, Int, Int) {
-        var (wins, draws, losses) = (0, 0, 0)
-        for game in 1...num {
-            print("Arena: playing game \(game) of \(num) (1v2)")
-            let result = playGame()
-            if result == 1 {
-                wins += 1
-            } else if result == -1 {
-                losses += 1
-            } else {
-                draws += 1
-            }
-        }
-        for game in 1...num {
-            print("Arena: playing game \(game) of \(num) (2v1)")
-            let result = playGame()
-            if result == -1 {
-                wins += 1
-            } else if result == 1 {
-                losses += 1
-            } else {
-                draws += 1
-            }
-        }
-        print("Arena: finished.")
-        return (wins, draws, losses)
-    }
-}
-
 public class Coach<Task: Game, Network: NNet> where Network.Task == Task {
     struct TrainExamples {
         var boards: [[[Float]]]
@@ -240,23 +183,21 @@ public class Coach<Task: Game, Network: NNet> where Network.Task == Task {
     
     private var game: Task
     private var nnet: Network
-    private var pnet: Network
     
     private let historyAccessSemaphore = DispatchSemaphore(value: 1)
     private var trainExamplesHistory: [TrainExamples] = []
     
     var mctsSims = 25
     var tempThreshold = 15
-    var iters = 100
-    var eps = 100
-    var historyThreshold = 20
+    var iters = 200
+    var eps = 300
+    var historyThreshold = 10
     var arenaGames = 20
     var updateThreshold: Float = 0.6
     
     init(game: Task, nnet: Network) {
         self.game = game
         self.nnet = nnet
-        self.pnet = Network(game: game)
     }
     
     func executeEpisode() -> TrainExamples {
@@ -315,7 +256,7 @@ public class Coach<Task: Game, Network: NNet> where Network.Task == Task {
             let accessSemaphore = DispatchSemaphore(value: 1)
             var episodesData: TrainExamples = .init(boards: [], pis: [], vs: [])
             DispatchQueue.global().async {
-                let spawnSemaphore = DispatchSemaphore(value: 35)
+                let spawnSemaphore = DispatchSemaphore(value: 65)
                 for episode in 1...self.eps {
                     spawnSemaphore.wait()
                     DispatchQueue.global().async {
@@ -344,28 +285,9 @@ public class Coach<Task: Game, Network: NNet> where Network.Task == Task {
             }
             
             let data = trainingData()
-            
-            nnet.save(checkpoint: "temp.h5")
-            pnet.load(checkpoint: "temp.h5")
-            var pmcts = MCTS(game: game, nnet: pnet, numSims: mctsSims)
-            
+
             nnet.train(boards: data.boards, pis: data.pis, vs: data.vs)
-            var nmcts = MCTS(game: game, nnet: nnet, numSims: mctsSims)
-            
-            print("PITTING AGAINST PREVIOUS VERSION")
-            
-            let arena = Arena(player1: { pmcts.getActionProbs(canonicalBoard: $0, temperature: 0).argmax()! }, player2: { nmcts.getActionProbs(canonicalBoard: $0, temperature: 0).argmax()! }, game: game)
-            let (pwins, draws, nwins) = arena.playGames(num: arenaGames)
-            
-            print("NEW/PREV WINS: \(nwins) / \(pwins) ; DRAWS: \(draws)")
-            
-            if pwins + nwins == 0 || Float(nwins) / Float(pwins + nwins) < updateThreshold {
-                print("REJECTING NEW MODEL")
-                nnet.load(checkpoint: "temp.h5")
-            } else {
-                print("ACCEPTING NEW MODEL")
-                nnet.save(checkpoint: "best\(iter).h5")
-            }
+            nnet.save(checkpoint: "iter\(iter).h5")
         }
     }
 }
