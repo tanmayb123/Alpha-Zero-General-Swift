@@ -8,7 +8,7 @@
 
 import Foundation
 import PythonKit
-PythonLibrary.useVersion(3, 7)
+PythonLibrary.useVersion(3, 6)
 
 let game = OthelloGame(n: 8)
 var nnet = OthelloNNet(game: game)

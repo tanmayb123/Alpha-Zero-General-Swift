@@ -10,7 +10,7 @@ import Foundation
 import TensorFlow
 import PythonKit
 
-let OTHELLO_PATH = "/home/tajymany/othello"
+let OTHELLO_PATH = "/home/tanmay/othello"
 
 let sys = Python.import("sys")
 let np = Python.import("numpy")
@@ -231,27 +231,34 @@ struct OthelloGame: Game {
         return board.map({ $0 * Float(player) })
     }
 
-    func getSymmetries(board: [[Float]], pi: [Float]) -> ([[[Float]]], [[Float]]) {
+    func getSymmetries(board: [[Float]], pi: [Float], valids: [Float]) -> ([[[Float]]], [[Float]], [[Float]]) {
         var piBoard = pi
         piBoard.removeLast()
+        var validsBoard = valids
+        validsBoard.removeLast()
         var boards: [[[Float]]] = [board]
         var pis: [[Float]] = [piBoard]
+        var validss: [[Float]] = [validsBoard]
 
         for i in 1..<4 {
             let newB = rotate90(boards.last!, size: n, dVal: 0)
             let newPi = rotate90(pis.last!, size: n, dVal: 0)
+            let newValids = rotate90(validss.last!, size: n, dVal: 0)
             boards.append(newB)
             pis.append(newPi)
+            validss.append(newValids)
         }
 
         for i in 0..<4 {
             boards.append(flip(boards[i]))
             pis.append(flip1d(pis[i], size: n))
+            validss.append(flip1d(validss[i], size: n))
         }
 
         pis = pis.map({ $0 + [pi.last!] })
+        validss = validss.map({ $0 + [valids.last!] })
 
-        return (boards, pis)
+        return (boards, pis, validss)
     }
     
     func simpleRepresentation(board: [[Float]]) -> String {
@@ -260,6 +267,11 @@ struct OthelloGame: Game {
 }
 
 struct OthelloModel: Layer {
+    struct Input: Differentiable {
+        var board: Tensor<Float>
+        var valids: Tensor<Float>
+    }
+
     struct Output: Differentiable {
         var policy: Tensor<Float>
         var value: Tensor<Float>
@@ -311,14 +323,16 @@ struct OthelloModel: Layer {
         cb4 = ConvBlock(filterShape: (3, 3, channels, channels), padding: .valid)
         db1 = DenseBlock(inputs: (r - 2 - 2) * (c - 2 - 2) * channels, outputs: 1024, dropoutProb: dropout)
         db2 = DenseBlock(inputs: 1024, outputs: 512, dropoutProb: dropout)
-        pi = Dense(inputSize: 512, outputSize: game.actionSize, activation: softmax)
+        pi = Dense(inputSize: 512, outputSize: game.actionSize)
         v = Dense(inputSize: 512, outputSize: 1, activation: tanh)
     }
 
-    func callAsFunction(_ input: Tensor<Float>) -> Output {
-        let conv = cb4(cb3(cb2(cb1(input.reshaped(to: [input.shape[0], r, c, 1])))))
+    func callAsFunction(_ input: Input) -> Output {
+        let conv = cb4(cb3(cb2(cb1(input.board.reshaped(to: [input.board.shape[0], r, c, 1])))))
         let dense = db2(db1(flattener(conv)))
-        return .init(policy: pi(dense), value: v(dense))
+        let policy = pi(dense)
+        let policyFixed = softmax(policy - ((Tensor<Float>(1.0) - input.valids.reshaped(to: policy.shape)) * Tensor<Float>(1000.0)))
+        return .init(policy: policyFixed, value: v(dense))
     }
 }
 
@@ -339,29 +353,31 @@ struct OthelloNNet: NNet {
     }
     
     let pyInterface: PyInterface = PyInterface()
-    
     var model: OthelloModel
+    let game: OthelloGame
     
     var channels = 512
     var dropout = 0.3
     var epochs = 10
-    var batchSize = 16384
+    var batchSize = 8
     
     init(game: OthelloGame) {
+        self.game = game
         self.model = OthelloModel(game: game, channels: 512, dropout: 0.3)
         OthelloNNet.pyQueue.sync {
             importPyWeights()
         }
     }
     
-    mutating func train(boards: [[[Float]]], pis: [[Float]], vs: [[Float]]) {
+    mutating func train(boards: [[[Float]]], pis: [[Float]], vs: [[Float]], valids: [[Float]]) {
         if !Thread.isMainThread {
             fatalError()
         }
         let boards = toTensor(boards).makeNumpyArray()
         let pis = toTensor(pis).makeNumpyArray()
         let vs = toTensor(vs).makeNumpyArray()
-        pyInterface.pyTrainer.train_model(pyInterface.pyModel, [boards, pis, vs], epochs: epochs, batch_size: batchSize)
+        let valids = toTensor(valids).makeNumpyArray()
+        pyInterface.pyTrainer.train_model(pyInterface.pyModel, [boards, valids, pis, vs], epochs: epochs, batch_size: batchSize)
         importPyWeights()
     }
     
@@ -380,16 +396,12 @@ struct OthelloNNet: NNet {
             model[keyPath: kp] = Tensor<Float>(numpy: pyWeights[kpIdx].astype("float32"))!
             kpIdx += 1
         }
-        
-        let exampleInput = Tensor<Float>(randomUniform: [1, 8, 8])
-        let pyOutput = Tensor<Float>(numpy: pyInterface.pyModel.predict(exampleInput.makeNumpyArray())[0].astype("float32"))!
-        let swiftOutput = model(exampleInput).policy
-        print("KERAS->S4TF Conversion MSE (post): \(pow(pyOutput - swiftOutput, Tensor(2)).mean())")
     }
     
-    func predict(board: [[Float]]) -> ([Float], Float) {
+    func predict(board: [[Float]], valids: [Float]) -> ([Float], Float) {
         let board = toTensor(board)
-        let prediction = model(board.expandingShape(at: 0))
+        let valids = toTensor(valids).reshaped(to: [1, game.actionSize, 1])
+        let prediction = model(.init(board: board.expandingShape(at: 0), valids: valids))
         return (prediction.policy[0].scalars, prediction.value[0][0].scalar!)
     }
     
@@ -400,21 +412,5 @@ struct OthelloNNet: NNet {
     mutating func load(checkpoint: String) {
         pyInterface.pyModel.load_weights("\(OTHELLO_PATH)/\(checkpoint)")
         importPyWeights()
-    }
-}
-
-func playRandomOthello() {
-    let g = OthelloGame(n: 8)
-    var b = g.initBoard
-    print(b)
-    var player = 1
-    while g.getGameEnded(board: b, player: 1) == 0 {
-        var move = (0..<g.actionSize).randomElement()!
-        let legals = g.getValidMoves(board: b, player: player)
-        while legals[move] == 0 {
-            move = (0..<g.actionSize).randomElement()!
-        }
-        (b, player) = g.getNextState(board: b, player: player, action: move)
-        print(b)
     }
 }

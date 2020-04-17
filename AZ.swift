@@ -20,7 +20,7 @@ public protocol Game {
     func getValidMoves(board: [[Float]], player: Int) -> [Float]
     func getGameEnded(board: [[Float]], player: Int) -> Float
     func getCanonicalForm(board: [[Float]], player: Int) -> [[Float]]
-    func getSymmetries(board: [[Float]], pi: [Float]) -> ([[[Float]]], [[Float]])
+    func getSymmetries(board: [[Float]], pi: [Float], valids: [Float]) -> ([[[Float]]], [[Float]], [[Float]])
     func simpleRepresentation(board: [[Float]]) -> SimpleRepresentation
 }
 
@@ -29,8 +29,8 @@ public protocol NNet {
     
     init(game: Task)
     
-    mutating func train(boards: [[[Float]]], pis: [[Float]], vs: [[Float]])
-    func predict(board: [[Float]]) -> ([Float], Float)
+    mutating func train(boards: [[[Float]]], pis: [[Float]], vs: [[Float]], valids: [[Float]])
+    func predict(board: [[Float]], valids: [Float]) -> ([Float], Float)
     
     func save(checkpoint: String)
     mutating func load(checkpoint: String)
@@ -107,10 +107,9 @@ public struct MCTS<Task: Game, Network: NNet> {
             }
             
             guard Ps.keys.contains(s) else {
-                let (p, v) = nnet.predict(board: canonicalBoard)
-                Ps[s] = p
                 let valids = game.getValidMoves(board: canonicalBoard, player: 1)
-                Ps[s]! *= valids
+                let (p, v) = nnet.predict(board: canonicalBoard, valids: valids)
+                Ps[s] = p
                 let sumP = Ps[s]!.reduce(0, +)
                 if sumP > 0 {
     //                print("Not all masked")
@@ -179,6 +178,7 @@ public class Coach<Task: Game, Network: NNet> where Network.Task == Task {
         var boards: [[[Float]]]
         var pis: [[Float]]
         var vs: [[Float]]
+        var valids: [[Float]]
     }
     
     private var game: Task
@@ -187,13 +187,11 @@ public class Coach<Task: Game, Network: NNet> where Network.Task == Task {
     private let historyAccessSemaphore = DispatchSemaphore(value: 1)
     private var trainExamplesHistory: [TrainExamples] = []
     
-    var mctsSims = 25
+    var mctsSims = 50
     var tempThreshold = 15
-    var iters = 200
+    var iters = 500
     var eps = 300
     var historyThreshold = 10
-    var arenaGames = 20
-    var updateThreshold: Float = 0.6
     
     init(game: Task, nnet: Network) {
         self.game = game
@@ -203,7 +201,7 @@ public class Coach<Task: Game, Network: NNet> where Network.Task == Task {
     func executeEpisode() -> TrainExamples {
         var mcts = MCTS(game: game, nnet: nnet, numSims: mctsSims)
         
-        var trainExamples: [([[Float]], Int, [Float])] = []
+        var trainExamples: [([[Float]], Int, [Float], [Float])] = []
         var board = game.initBoard
         var currentPlayer: Int = 1
         var episodeStep = 0
@@ -214,9 +212,10 @@ public class Coach<Task: Game, Network: NNet> where Network.Task == Task {
             let temp: Float = episodeStep < tempThreshold ? 1 : 0
             
             let pi = mcts.getActionProbs(canonicalBoard: canonicalBoard, temperature: temp)
-            let (boardSyms, piSyms) = game.getSymmetries(board: canonicalBoard, pi: pi)
-            for val in zip(boardSyms, piSyms) {
-                trainExamples.append((val.0, currentPlayer, val.1))
+            let valids = game.getValidMoves(board: canonicalBoard, player: 1)
+            let (boardSyms, piSyms, valSyms) = game.getSymmetries(board: canonicalBoard, pi: pi, valids: valids)
+            for symIdx in 0..<boardSyms.count {
+                trainExamples.append((boardSyms[symIdx], currentPlayer, piSyms[symIdx], valSyms[symIdx]))
             }
             
             let action = random(probabilities: pi)
@@ -228,22 +227,25 @@ public class Coach<Task: Game, Network: NNet> where Network.Task == Task {
                 let boards = trainExamples.map({ $0.0 })
                 let pis = trainExamples.map({ $0.2 })
                 let vs = trainExamples.map({ [Float]([r * Float($0.1 != currentPlayer ? -1 : 1)]) })
-                return .init(boards: boards, pis: pis, vs: vs)
+                let valids = trainExamples.map({ $0.3 })
+                return .init(boards: boards, pis: pis, vs: vs, valids: valids)
             }
         }
     }
     
     func trainingData() -> TrainExamples {
-        var data = TrainExamples(boards: [], pis: [], vs: [])
+        var data = TrainExamples(boards: [], pis: [], vs: [], valids: [])
         for iterData in trainExamplesHistory {
             data.boards += iterData.boards
             data.pis += iterData.pis
             data.vs += iterData.vs
+            data.valids += iterData.valids
         }
         let examples = Array(0..<data.boards.count).shuffled()
         data.boards = examples.map({ data.boards[$0] })
         data.pis = examples.map({ data.pis[$0] })
         data.vs = examples.map({ data.vs[$0] })
+        data.valids = examples.map({ data.valids[$0] })
         return data
     }
 
@@ -254,7 +256,7 @@ public class Coach<Task: Game, Network: NNet> where Network.Task == Task {
             let completionSemaphore = DispatchSemaphore(value: 0)
             
             let accessSemaphore = DispatchSemaphore(value: 1)
-            var episodesData: TrainExamples = .init(boards: [], pis: [], vs: [])
+            var episodesData: TrainExamples = .init(boards: [], pis: [], vs: [], valids: [])
             DispatchQueue.global().async {
                 let spawnSemaphore = DispatchSemaphore(value: 65)
                 for episode in 1...self.eps {
@@ -270,6 +272,7 @@ public class Coach<Task: Game, Network: NNet> where Network.Task == Task {
                         episodesData.boards += result.boards
                         episodesData.pis += result.pis
                         episodesData.vs += result.vs
+                        episodesData.valids += result.valids
                         accessSemaphore.signal()
                     }
                 }
@@ -286,7 +289,7 @@ public class Coach<Task: Game, Network: NNet> where Network.Task == Task {
             
             let data = trainingData()
 
-            nnet.train(boards: data.boards, pis: data.pis, vs: data.vs)
+            nnet.train(boards: data.boards, pis: data.pis, vs: data.vs, valids: data.valids)
             nnet.save(checkpoint: "iter\(iter).h5")
         }
     }
