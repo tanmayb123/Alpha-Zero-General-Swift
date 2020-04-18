@@ -7,10 +7,6 @@
 //
 
 import Foundation
-import PythonKit
-
-let EPS: Float = 1e-5
-let WORKERS = ["testworker.ngrok.io"].map { "http://\($0):8080/" }
 
 public protocol Game {
     associatedtype SimpleRepresentation: Hashable
@@ -137,9 +133,9 @@ public struct MCTS<Task: Game, Network: NNet> {
                 if valids[a] == 1 {
                     let u: Float
                     if Qsa.keys.contains(SA(s, a)) {
-                        u = Qsa[SA(s, a)]! + 1 * Ps[s]![a] * sqrt(Ns[s]!) / (1 + Nsa[SA(s, a)]!)
+                        u = Qsa[SA(s, a)]! + 3 * Ps[s]![a] * sqrt(Ns[s]!) / (1 + Nsa[SA(s, a)]!)
                     } else {
-                        u = 1 * Ps[s]![a] * sqrt(Ns[s]! + EPS)
+                        u = 3 * Ps[s]![a] * sqrt(Ns[s]! + EPS)
                     }
                     
                     if u > currentBest {
@@ -177,95 +173,57 @@ public struct MCTS<Task: Game, Network: NNet> {
     }
 }
 
-public class DistributedCoach<Task: Game, Network: NNet> where Network.Task == Task {
+public class EpisodeExecutor<Task: Game, Network: NNet> where Network.Task == Task {
     struct TrainExamples {
         var boards: [[[Float]]]
         var pis: [[Float]]
         var vs: [[Float]]
         var valids: [[Float]]
-
-        mutating func add(_ other: TrainExamples) {
-            boards += other.boards
-            pis += other.pis
-            vs += other.vs
-            valids += other.valids
-        }
-
-        mutating func reset() {
-            boards = []
-            pis = []
-            vs = []
-            valids = []
-        }
     }
-    
+
     private var game: Task
     private var nnet: Network
-    
+
     var mctsSims = 40
     var tempThreshold = 15
-    var iters = 500
-    var eps = 2500
 
-    var totalEpisodes = 0
-    var iterationExamples: TrainExamples = .init(boards: [], pis: [], vs: [], valids: [])
-    let iterationExamplesAccessSemaphore = DispatchSemaphore(value: 1)
-    let iterationCompleteSemaphore = DispatchSemaphore(value: 0)
-    
     init(game: Task, nnet: Network) {
         self.game = game
-        self.nnet = nnet
+        self.nnet = neet
     }
 
-    func sendNetworkToWorkers() {
-        for worker in WORKERS {
-            _ = AF.request(worker + "getNetwork", parameters: ["id": id], method: .get)
-        }
-    }
+    func executeEpisode() -> TrainExamples {
+        var mcts = MCTS(game: game, nnet: nnet, numSims: mctsSims)
 
-    func launchWorkers() {
-        for worker in WORKERS {
-            _ = AF.request(worker + "generate", method: .get)
-        }
-    }
+        var trainExamples: [([[Float]], Int, [Float], [Float])] = []
+        var board = game.initBoard
+        var currentPlayer: Int = 1
+        var episodeStep = 0
 
-    func stopWorkers() {
-        for worker in WORKERS {
-            _ = AF.request(worker + "stop", method: .get)
-        }
-    }
-    
-    func gotEpisode(data: TrainExamples) {
-        iterationExamplesAccessSemaphore.wait()
-        totalEpisodes += 1
-        iterationExamples.add(data)
-        if totalEpisodes >= eps {
-            iterationCompleteSemaphore.signal()
-        }
-        iterationExamplesAccessSemaphore.signal()
-    }
-   
-    func learn() {
-        nnet.save(checkpoint: "masterinit.h5")
-        sendNetworkToWorkers(id: "init")
+        while true {
+            episodeStep += 1
+            let canonicalBoard = game.getCanonicalForm(board: board, player: currentPlayer)
+            let temp: Float = episodeStep < tempThreshold ? 1 : 0
 
-        for iter in 1...iters {
-            print("Iter \(iter)")
+            let pi = mcts.getActionProbs(canonicalBoard: canonicalBoard, temperature: temp)
+            let valids = game.getValidMoves(board: canonicalBoard, player: 1)
+            let (boardSyms, piSyms, valSyms) = game.getSymmetries(board: canonicalBoard, pi: pi, valids: valids)
+            for symIdx in 0..<boardSyms.count {
+                trainExamples.append((boardSyms[symIdx], currentPlayer, piSyms[symIdx], valSyms[symIdx]))
+            }
 
-            totalEpisodes = 0
-            iterationExamples.reset()
+            let action = random(probabilities: pi)
+            (board, currentPlayer) = game.getNextState(board: board, player: currentPlayer, action: action)
 
-            launchWorkers()
-            iterationCompleteSemaphore.wait()
-            stopWorkers()
+            let r = game.getGameEnded(board: board, player: currentPlayer)
 
-            iterationExamplesAccessSemaphore.wait()
-            
-            nnet.storeEpisode(boards: iterationExamples.boards, pis: iterationExamples.pis, vs: iterationExamples.vs, valids: iterationExamples.valids)
-            nnet.train()
-
-            nnet.save(checkpoint: "masteriter\(iter).h5")
-            sendNetworkToWorkers(id: "\(iter)")
+            if r != 0 {
+                let boards = trainExamples.map({ $0.0 })
+                let pis = trainExamples.map({ $0.2 })
+                let vs = trainExamples.map({ [Float]([r * Float($0.1 != currentPlayer ? -1 : 1)]) })
+                let valids = trainExamples.map({ $0.3 })
+                return .init(boards: boards, pis: pis, vs: vs, valids: valids)
+            }
         }
     }
 }

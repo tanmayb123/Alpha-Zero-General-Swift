@@ -10,7 +10,7 @@ import Foundation
 import TensorFlow
 import PythonKit
 
-let OTHELLO_PATH = "/Users/tanmaybakshi/othello"
+let OTHELLO_PATH = "/home/tajymany/othello"
 
 let sys = Python.import("sys")
 
@@ -321,12 +321,11 @@ struct OthelloModel: Layer {
 
     var cb: ConvBlock
     var res: [ResidualBlock] = []
-    var piconv: Conv2D<Float>
-    var vconv: Conv2D<Float>
-    @noDerivative let flat: Flatten<Float> = .init()
-    var pidense: Dense<Float>
-    var vdense1: Dense<Float>
-    var vdense2: Dense<Float>
+    @noDerivative let flattener: Flatten<Float> = Flatten()
+    var db1: DenseBlock
+    var db2: DenseBlock
+    var pi: Dense<Float>
+    var v: Dense<Float>
 
     init(game: OthelloGame, dropout: Double) {
         (self.r, self.c) = (game.n, game.n)
@@ -334,21 +333,10 @@ struct OthelloModel: Layer {
         for _ in 1...10 {
             res.append(ResidualBlock())
         }
-        piconv = Conv2D(filterShape: (1, 1, 64, 2), padding: .same, activation: relu, useBias: false)
-        vconv = Conv2D(filterShape: (1, 1, 64, 1), padding: .same, activation: relu, useBias: false)
-        pidense = Dense(inputSize: r * c * 2, outputSize: game.actionSize)
-        vdense1 = Dense(inputSize: r * c, outputSize: 64, activation: relu)
-        vdense2 = Dense(inputSize: 64, outputSize: 1, activation: tanh)
-    }
-
-    @differentiable
-    func pi(_ input: Tensor<Float>) -> Tensor<Float> {
-        return pidense(flat(piconv(input)))
-    }
-
-    @differentiable
-    func v(_ input: Tensor<Float>) -> Tensor<Float> {
-        return vdense2(vdense1(flat(vconv(input))))
+        db1 = DenseBlock(inputs: r * c * 64, outputs: 1024, dropoutProb: dropout)
+        db2 = DenseBlock(inputs: 1024, outputs: 512, dropoutProb: dropout)
+        pi = Dense(inputSize: 512, outputSize: game.actionSize)
+        v = Dense(inputSize: 512, outputSize: 1, activation: tanh)
     }
 
     func callAsFunction(_ input: Input) -> Output {
@@ -356,9 +344,10 @@ struct OthelloModel: Layer {
         for i in withoutDerivative(at: 0..<res.count) {
             convOutput = res[i](convOutput)
         }
-        let policy = pi(convOutput)
+        let dense = db2(db1(flattener(convOutput)))
+        let policy = pi(dense)
         let policyFixed = softmax(policy - ((Tensor<Float>(1.0) - input.valids.reshaped(to: policy.shape)) * Tensor<Float>(1000.0)))
-        return .init(policy: policyFixed, value: v(convOutput))
+        return .init(policy: policyFixed, value: v(dense))
     }
 }
 
