@@ -10,10 +10,9 @@ import Foundation
 import TensorFlow
 import PythonKit
 
-let OTHELLO_PATH = "/home/tanmay/othello"
+let OTHELLO_PATH = "/home/tajymany/othello"
 
 let sys = Python.import("sys")
-let np = Python.import("numpy")
 
 struct OthelloLogic {
     struct Coord: Hashable {
@@ -280,12 +279,27 @@ struct OthelloModel: Layer {
     struct ConvBlock: Layer {
         var conv: Conv2D<Float>
 
-        init(filterShape: (Int, Int, Int, Int), padding: Padding) {
-            conv = Conv2D(filterShape: filterShape, padding: padding, useBias: false)
+        init(inputChannels: Int = 64, activation: Bool = true) {
+            if activation {
+                conv = Conv2D(filterShape: (3, 3, inputChannels, 64), padding: .same, activation: relu, useBias: false)
+            } else {
+                conv = Conv2D(filterShape: (3, 3, inputChannels, 64), padding: .same, useBias: false)
+            }
         }
 
         func callAsFunction(_ input: Tensor<Float>) -> Tensor<Float> {
-            return relu(conv(input))
+            return conv(input)
+        }
+    }
+
+    struct ResidualBlock: Layer {
+        var conv1: ConvBlock = .init()
+        var conv2: ConvBlock = .init(activation: false)
+
+        init() {}
+
+        func callAsFunction(_ input: Tensor<Float>) -> Tensor<Float> {
+            return relu(input + conv2(conv1(input)))
         }
     }
 
@@ -305,31 +319,32 @@ struct OthelloModel: Layer {
 
     @noDerivative private let r, c: Int
 
-    var cb1: ConvBlock
-    var cb2: ConvBlock
-    var cb3: ConvBlock
-    var cb4: ConvBlock
+    var cb: ConvBlock
+    var res: [ResidualBlock] = []
     @noDerivative let flattener: Flatten<Float> = Flatten()
     var db1: DenseBlock
     var db2: DenseBlock
     var pi: Dense<Float>
     var v: Dense<Float>
 
-    init(game: OthelloGame, channels: Int, dropout: Double) {
+    init(game: OthelloGame, dropout: Double) {
         (self.r, self.c) = (game.n, game.n)
-        cb1 = ConvBlock(filterShape: (3, 3, 1, channels), padding: .same)
-        cb2 = ConvBlock(filterShape: (3, 3, channels, channels), padding: .same)
-        cb3 = ConvBlock(filterShape: (3, 3, channels, channels), padding: .valid)
-        cb4 = ConvBlock(filterShape: (3, 3, channels, channels), padding: .valid)
-        db1 = DenseBlock(inputs: (r - 2 - 2) * (c - 2 - 2) * channels, outputs: 1024, dropoutProb: dropout)
+        cb = ConvBlock(inputChannels: 1)
+        for _ in 1...10 {
+            res.append(ResidualBlock())
+        }
+        db1 = DenseBlock(inputs: r * c * 64, outputs: 1024, dropoutProb: dropout)
         db2 = DenseBlock(inputs: 1024, outputs: 512, dropoutProb: dropout)
         pi = Dense(inputSize: 512, outputSize: game.actionSize)
         v = Dense(inputSize: 512, outputSize: 1, activation: tanh)
     }
 
     func callAsFunction(_ input: Input) -> Output {
-        let conv = cb4(cb3(cb2(cb1(input.board.reshaped(to: [input.board.shape[0], r, c, 1])))))
-        let dense = db2(db1(flattener(conv)))
+        var convOutput = cb(input.board.reshaped(to: [input.board.shape[0], r, c, 1]))
+        for i in withoutDerivative(at: 0..<res.count) {
+            convOutput = res[i](convOutput)
+        }
+        let dense = db2(db1(flattener(convOutput)))
         let policy = pi(dense)
         let policyFixed = softmax(policy - ((Tensor<Float>(1.0) - input.valids.reshaped(to: policy.shape)) * Tensor<Float>(1000.0)))
         return .init(policy: policyFixed, value: v(dense))
@@ -340,14 +355,13 @@ struct OthelloNNet: NNet {
     static let pyQueue = DispatchQueue(label: "py")
     
     struct PyInterface {
-        var pyTrainer: PythonObject! = nil
         var pyModel: PythonObject! = nil
         
         init() {
             OthelloNNet.pyQueue.sync {
                 sys.path.append(OTHELLO_PATH)
-                pyTrainer = Python.import("othello_trainer")
-                pyModel = pyTrainer.get_model()
+                let pyTrainer = Python.import("othello_trainer")
+                pyModel = pyTrainer.PyOthelloModel()
             }
         }
     }
@@ -356,33 +370,36 @@ struct OthelloNNet: NNet {
     var model: OthelloModel
     let game: OthelloGame
     
-    var channels = 512
     var dropout = 0.3
-    var epochs = 10
-    var batchSize = 8
+    var epochs = 35
+    var batchSize = 16384
     
     init(game: OthelloGame) {
         self.game = game
-        self.model = OthelloModel(game: game, channels: 512, dropout: 0.3)
+        self.model = OthelloModel(game: game, dropout: 0.3)
         OthelloNNet.pyQueue.sync {
             importPyWeights()
         }
     }
     
-    mutating func train(boards: [[[Float]]], pis: [[Float]], vs: [[Float]], valids: [[Float]]) {
+    mutating func train() {
         if !Thread.isMainThread {
             fatalError()
         }
+        pyInterface.pyModel.train_model(epochs: epochs, batch_size: batchSize)
+        importPyWeights()
+    }
+
+    mutating func storeEpisode(boards: [[[Float]]], pis: [[Float]], vs: [[Float]], valids: [[Float]]) {
         let boards = toTensor(boards).makeNumpyArray()
         let pis = toTensor(pis).makeNumpyArray()
         let vs = toTensor(vs).makeNumpyArray()
         let valids = toTensor(valids).makeNumpyArray()
-        pyInterface.pyTrainer.train_model(pyInterface.pyModel, [boards, valids, pis, vs], epochs: epochs, batch_size: batchSize)
-        importPyWeights()
+        pyInterface.pyModel.add_data([boards, valids, pis, vs])
     }
     
     mutating func importPyWeights() {
-        let pyWeights = pyInterface.pyTrainer.get_swift_weights(pyInterface.pyModel)
+        let pyWeights = pyInterface.pyModel.get_swift_weights()
         var kpIdx = 0
         for kp in model.recursivelyAllWritableKeyPaths(to: Tensor<Float>.self) {
             let swiftShape = model[keyPath: kp].shapeTensor.scalars
@@ -396,6 +413,15 @@ struct OthelloNNet: NNet {
             model[keyPath: kp] = Tensor<Float>(numpy: pyWeights[kpIdx].astype("float32"))!
             kpIdx += 1
         }
+
+        let randomInputBoard = Tensor<Float>(randomUniform: [1, 8, 8])
+        let randomInputLegals = Tensor<Float>(ones: [1, 65])
+        let swiftPred = model(.init(board: randomInputBoard, valids: randomInputLegals))
+        let swiftPolicy = Tensor(swiftPred.policy[0].scalars)
+        let kerasPred = pyInterface.pyModel.model.predict([randomInputBoard.makeNumpyArray(), randomInputLegals.makeNumpyArray()])
+        let kerasPolicy = Tensor<Float>(numpy: kerasPred[0])!
+        let msePolicy = pow(swiftPolicy - kerasPolicy, Tensor(2.0)).mean()
+        print("KERAS->S4TF CONVERSION MSE: \(msePolicy)")
     }
     
     func predict(board: [[Float]], valids: [Float]) -> ([Float], Float) {
@@ -406,11 +432,11 @@ struct OthelloNNet: NNet {
     }
     
     func save(checkpoint: String) {
-        pyInterface.pyModel.save_weights("\(OTHELLO_PATH)/\(checkpoint)")
+        pyInterface.pyModel.model.save_weights("\(OTHELLO_PATH)/\(checkpoint)")
     }
     
     mutating func load(checkpoint: String) {
-        pyInterface.pyModel.load_weights("\(OTHELLO_PATH)/\(checkpoint)")
+        pyInterface.pyModel.model.load_weights("\(OTHELLO_PATH)/\(checkpoint)")
         importPyWeights()
     }
 }

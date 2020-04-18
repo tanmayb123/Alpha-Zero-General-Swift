@@ -7,6 +7,7 @@
 //
 
 import Foundation
+import PythonKit
 
 let EPS: Float = 1e-5
 
@@ -29,8 +30,10 @@ public protocol NNet {
     
     init(game: Task)
     
-    mutating func train(boards: [[[Float]]], pis: [[Float]], vs: [[Float]], valids: [[Float]])
+    mutating func train()
     func predict(board: [[Float]], valids: [Float]) -> ([Float], Float)
+
+    mutating func storeEpisode(boards: [[[Float]]], pis: [[Float]], vs: [[Float]], valids: [[Float]])
     
     func save(checkpoint: String)
     mutating func load(checkpoint: String)
@@ -58,7 +61,7 @@ public struct MCTS<Task: Game, Network: NNet> {
     
     private var Es: [Task.SimpleRepresentation: Float] = [:]
     private var Vs: [Task.SimpleRepresentation: [Float]] = [:]
-    
+
     init(game: Task, nnet: Network, numSims: Int) {
         self.game = game
         self.nnet = nnet
@@ -87,7 +90,7 @@ public struct MCTS<Task: Game, Network: NNet> {
         let probs = counts.map({ $0 / countsSum })
         return probs
     }
-    
+
     mutating func search(canonicalBoard: [[Float]]) {
         var boards: [[[Float]]] = [canonicalBoard]
         
@@ -133,9 +136,9 @@ public struct MCTS<Task: Game, Network: NNet> {
                 if valids[a] == 1 {
                     let u: Float
                     if Qsa.keys.contains(SA(s, a)) {
-                        u = Qsa[SA(s, a)]! + 1 * Ps[s]![a] * sqrt(Ns[s]!) / (1 + Nsa[SA(s, a)]!)
+                        u = Qsa[SA(s, a)]! + 3 * Ps[s]![a] * sqrt(Ns[s]!) / (1 + Nsa[SA(s, a)]!)
                     } else {
-                        u = 1 * Ps[s]![a] * sqrt(Ns[s]! + EPS)
+                        u = 3 * Ps[s]![a] * sqrt(Ns[s]! + EPS)
                     }
                     
                     if u > currentBest {
@@ -184,14 +187,10 @@ public class Coach<Task: Game, Network: NNet> where Network.Task == Task {
     private var game: Task
     private var nnet: Network
     
-    private let historyAccessSemaphore = DispatchSemaphore(value: 1)
-    private var trainExamplesHistory: [TrainExamples] = []
-    
-    var mctsSims = 50
+    var mctsSims = 40
     var tempThreshold = 15
     var iters = 500
-    var eps = 300
-    var historyThreshold = 10
+    var eps = 2500
     
     init(game: Task, nnet: Network) {
         self.game = game
@@ -233,22 +232,6 @@ public class Coach<Task: Game, Network: NNet> where Network.Task == Task {
         }
     }
     
-    func trainingData() -> TrainExamples {
-        var data = TrainExamples(boards: [], pis: [], vs: [], valids: [])
-        for iterData in trainExamplesHistory {
-            data.boards += iterData.boards
-            data.pis += iterData.pis
-            data.vs += iterData.vs
-            data.valids += iterData.valids
-        }
-        let examples = Array(0..<data.boards.count).shuffled()
-        data.boards = examples.map({ data.boards[$0] })
-        data.pis = examples.map({ data.pis[$0] })
-        data.vs = examples.map({ data.vs[$0] })
-        data.valids = examples.map({ data.valids[$0] })
-        return data
-    }
-
     func learn() {
         for iter in 1...iters {
             print("Iter \(iter)")
@@ -264,10 +247,10 @@ public class Coach<Task: Game, Network: NNet> where Network.Task == Task {
                     DispatchQueue.global().async {
                         defer {
                             completionSemaphore.signal()
-                            spawnSemaphore.signal()
                         }
                         
                         let result = self.executeEpisode()
+                        spawnSemaphore.signal()
                         accessSemaphore.wait()
                         episodesData.boards += result.boards
                         episodesData.pis += result.pis
@@ -281,15 +264,9 @@ public class Coach<Task: Game, Network: NNet> where Network.Task == Task {
                 completionSemaphore.wait()
                 print("Done episode \(episode)")
             }
-            trainExamplesHistory.append(episodesData)
-            
-            if trainExamplesHistory.count > historyThreshold {
-                trainExamplesHistory.removeFirst()
-            }
-            
-            let data = trainingData()
 
-            nnet.train(boards: data.boards, pis: data.pis, vs: data.vs, valids: data.valids)
+            nnet.storeEpisode(boards: episodesData.boards, pis: episodesData.pis, vs: episodesData.vs, valids: episodesData.valids)
+            nnet.train()
             nnet.save(checkpoint: "iter\(iter).h5")
         }
     }

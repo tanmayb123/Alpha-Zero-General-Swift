@@ -68,6 +68,15 @@ func flip1d<T>(_ arr: [T], size: Int) -> [T] {
     return arr2d.reduce([], +)
 }
 
+func +<T: AdditiveArithmetic>(lhs: [T], rhs: [T]) -> [T] {
+    var newArray: [T] = []
+    newArray.reserveCapacity(lhs.count)
+    for i in 0..<lhs.count {
+        newArray.append(lhs[i] + rhs[i])
+    }
+    return newArray
+}
+
 func *<T: Numeric>(lhs: [T], rhs: T) -> [T] {
     var newArray: [T] = []
     newArray.reserveCapacity(lhs.count)

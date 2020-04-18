@@ -9,53 +9,101 @@ from tensorflow.keras.optimizers import *
 def fix_pi(pi, valids):
     return tf.math.softmax(pi - ((1 - valids) * 1000))
 
-def i_get_model():
-    input_boards = Input(shape=(8, 8))
-    input_valids = Input(shape=(65,))
-    x_image = Reshape((8, 8, 1))(input_boards)                # batch_size  x board_x x board_y x 1
-    h_conv1 = Activation('relu')(Conv2D(512, 3, padding='same', use_bias=False)(x_image))         # batch_size  x board_x x board_y x num_channels
-    h_conv2 = Activation('relu')(Conv2D(512, 3, padding='same', use_bias=False)(h_conv1))         # batch_size  x board_x x board_y x num_channels
-    h_conv3 = Activation('relu')(Conv2D(512, 3, padding='valid', use_bias=False)(h_conv2))        # batch_size  x (board_x-2) x (board_y-2) x num_channels
-    h_conv4 = Activation('relu')(Conv2D(512, 3, padding='valid', use_bias=False)(h_conv3))        # batch_size  x (board_x-4) x (board_y-4) x num_channels
-    h_conv4_flat = Flatten()(h_conv4)
-    s_fc1 = Dropout(0.3)(Activation('relu')(Dense(1024, use_bias=False)(h_conv4_flat)))  # batch_size x 1024
-    s_fc2 = Dropout(0.3)(Activation('relu')(Dense(512, use_bias=False)(s_fc1)))          # batch_size x 1024
-    prepi = Dense(65, name='pi')(s_fc2)   # batch_size x self.action_size
-    postpi = Lambda(lambda x: fix_pi(x[0], x[1]))([prepi, input_valids])
-    v = Dense(1, activation='tanh', name='v')(s_fc2)                    # batch_size x 1
+def conv_block(x):
+    x = Conv2D(64, 3, padding='same', use_bias=False, activation='relu')(x)
+    return x
 
-    model = Model(inputs=[input_boards, input_valids], outputs=[postpi, v])
-    model.compile(loss=['categorical_crossentropy','mean_squared_error'], optimizer=Adam(0.003))
+def res_block(x):
+    orig_x = x
+    x = Conv2D(64, 3, padding='same', use_bias=False, activation='relu')(x)
+    x = Conv2D(64, 3, padding='same', use_bias=False)(x)
+    x = Add()([x, orig_x])
+    x = Activation('relu')(x)
+    return x
 
-    return model
+class PyOthelloModel:
+    def __init__(self):
+        self.model = self.get_model()
+        self.data = None
+        self.episodeDataCounts = []
 
-def get_swift_weights(model):
-    w = []
-    for layer in model.layers:
-        w += layer.get_weights()
-    return w
+    def i_get_model(self):
+        input_boards = Input(shape=(8, 8))
+        input_valids = Input(shape=(65,))
+        x_image = Reshape((8, 8, 1))(input_boards)                # batch_size  x board_x x board_y x 1
+        x = conv_block(x_image)
+        for i in range(10):
+            x = res_block(x)
+        h_conv4_flat = Flatten()(x)
+        s_fc1 = Dropout(0.3)(Activation('relu')(Dense(1024, use_bias=False)(h_conv4_flat)))  # batch_size x 1024
+        s_fc2 = Dropout(0.3)(Activation('relu')(Dense(512, use_bias=False)(s_fc1)))          # batch_size x 1024
+        prepi = Dense(65, name='pi')(s_fc2)   # batch_size x self.action_size
+        postpi = Lambda(lambda x: fix_pi(x[0], x[1]))([prepi, input_valids])
+        v = Dense(1, activation='tanh', name='v')(s_fc2)                    # batch_size x 1
 
-def get_model():
-    return i_get_model()
-    if os.path.isfile("/home/tajymany/tpu_lock"):
-        return i_get_model()
-    
-    os.popen("touch /home/tajymany/tpu_lock")
+        model = Model(inputs=[input_boards, input_valids], outputs=[postpi, v])
+        model.compile(loss=['categorical_crossentropy','mean_squared_error'], optimizer=Adam(0.006))
 
-    resolver =  tf.distribute.cluster_resolver.TPUClusterResolver("grpc://10.213.40.50:8470")
-    tf.config.experimental_connect_to_cluster(resolver)
-    tf.tpu.experimental.initialize_tpu_system(resolver)
-    strategy = tf.distribute.experimental.TPUStrategy(resolver)
+        model.summary()
 
-    with strategy.scope():
-        m = i_get_model()
+        return model
 
-    return m
+    def get_swift_weights(self):
+        w = []
+        for layer in self.model.layers:
+            w += layer.get_weights()
+        return w
 
-def train_model(model, data, batch_size, epochs):
-    i = data[0].shape[0] % batch_size
-    boarddata = data[0][:-i]
-    validsdata = data[1][:-i]
-    pidata = data[2][:-i]
-    vdata = data[3][:-i]
-    model.fit([boarddata, validsdata], [pidata, vdata], batch_size=batch_size, epochs=epochs, verbose=1)
+    def get_model(self):
+        if os.path.isfile("/home/tajymany/tpu_lock"):
+            return self.i_get_model()
+        
+        os.popen("touch /home/tajymany/tpu_lock")
+
+        resolver =  tf.distribute.cluster_resolver.TPUClusterResolver(tpu='mediumboy', project='asktanmayb', zone='us-central1-a')
+        tf.config.experimental_connect_to_cluster(resolver)
+        tf.tpu.experimental.initialize_tpu_system(resolver)
+        strategy = tf.distribute.experimental.TPUStrategy(resolver)
+
+        with strategy.scope():
+            m = self.i_get_model()
+
+        return m
+
+    def train_model(self, batch_size, epochs):
+        i = self.data[0].shape[0] % batch_size
+        if i > 0:
+            boarddata = self.data[0][:-i]
+            validsdata = self.data[1][:-i]
+            pidata = self.data[2][:-i]
+            vdata = self.data[3][:-i]
+        else:
+            boarddata = self.data[0]
+            validsdata = self.data[1]
+            pidata = self.data[2]
+            vdata = self.data[3]
+        p = np.random.permutation(len(boarddata))
+        boarddata = boarddata[p]
+        validsdata = validsdata[p]
+        pidata = pidata[p]
+        vdata = vdata[p]
+        print([x.shape for x in [boarddata, validsdata, pidata, vdata]])
+        self.model.fit([boarddata, validsdata], [pidata, vdata], batch_size=batch_size, epochs=epochs, verbose=1)
+
+    def add_data(self, data):
+        self.episodeDataCounts.append(data[0].shape[0])
+
+        if self.data is None:
+            self.data = data
+            return
+
+        for i in range(4):
+            self.data[i] = np.concatenate([self.data[i], data[i]], axis=0)
+
+        if len(self.episodeDataCounts) > 1:
+            self.remove_first_episode()
+
+    def remove_first_episode(self):
+        for i in range(4):
+            self.data[i] = self.data[i][self.episodeDataCounts[0]:]
+        del self.episodeDataCounts[0]
