@@ -21,6 +21,19 @@ def res_block(x):
     x = Activation('relu')(x)
     return x
 
+def policy_head(x):
+    x = Conv2D(2, 1, padding='same', use_bias=False, activation='relu')(x)
+    x = Flatten()(x)
+    x = Dense(65)(x)
+    return x
+
+def value_head(x):
+    x = Conv2D(1, 1, padding='same', use_bias=False, activation='relu')(x)
+    x = Flatten()(x)
+    x = Dense(64, activation='relu')(x)
+    x = Dense(1, activation='tanh', name='v')(x)
+    return x
+
 class PyOthelloModel:
     def __init__(self):
         self.model = self.get_model()
@@ -34,12 +47,9 @@ class PyOthelloModel:
         x = conv_block(x_image)
         for i in range(10):
             x = res_block(x)
-        h_conv4_flat = Flatten()(x)
-        s_fc1 = Dropout(0.3)(Activation('relu')(Dense(1024, use_bias=False)(h_conv4_flat)))  # batch_size x 1024
-        s_fc2 = Dropout(0.3)(Activation('relu')(Dense(512, use_bias=False)(s_fc1)))          # batch_size x 1024
-        prepi = Dense(65, name='pi')(s_fc2)   # batch_size x self.action_size
-        postpi = Lambda(lambda x: fix_pi(x[0], x[1]))([prepi, input_valids])
-        v = Dense(1, activation='tanh', name='v')(s_fc2)                    # batch_size x 1
+        prepi = policy_head(x)   # batch_size x self.action_size
+        postpi = Lambda(lambda x: fix_pi(x[0], x[1]), name='pi')([prepi, input_valids])
+        v = value_head(x)                    # batch_size x 1
 
         model = Model(inputs=[input_boards, input_valids], outputs=[postpi, v])
         model.compile(loss=['categorical_crossentropy','mean_squared_error'], optimizer=Adam(0.006))
@@ -55,6 +65,7 @@ class PyOthelloModel:
         return w
 
     def get_model(self):
+        return self.i_get_model()
         if os.path.isfile("/home/tajymany/tpu_lock"):
             return self.i_get_model()
         
